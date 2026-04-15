@@ -1,0 +1,463 @@
+---
+title: "When Water Becomes a Privilege: The Global Crisis of Safe Drinking Water"
+author: "UNICEF Data Analyst"
+date: today
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    toc-title: "Table of Contents"
+    fig-width: 11
+    fig-height: 6
+    number-sections: false
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+---
+
+## Introduction
+
+> *"Water is the driving force of all nature."* - Leonardo da Vinci
+
+Water is a fundamental human right, not just a resource. Yet for hundreds of millions of people, access to safely managed drinking water is still out of reach. Contaminated water kills more children every year than malaria, measles, and HIV/AIDS combined.
+
+This report uses **UNICEF data from 2000 to 2024** to look at how much progress has actually been made, and where the biggest gaps still exist.
+
+What the data shows is a world of pretty stark contrasts. Wealthy nations have near-universal access to safe water. Large parts of Sub-Saharan Africa and South Asia are still struggling to provide it. And one of the clearest things the data tells us is that your chances of accessing clean water are closely tied to where you were born.
+
+### Key Questions This Report Addresses
+
+- Which countries and regions have the **lowest access** to safely managed drinking water?
+- How has global water access **changed over time**?
+- Is there a link between a country's **economic wealth** and its water access?
+- Where is the **sanitation infrastructure** failing most?
+
+---
+
+## Data and Methods
+
+```{python}
+#| label: setup
+#| echo: false
+
+import polars as pl
+import pandas as pd
+import geopandas as gpd
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
+
+from plotnine import (
+    ggplot, aes, geom_map, geom_col, geom_point, geom_line,
+    geom_smooth, geom_text, geom_hline, geom_ribbon,
+    scale_fill_gradientn, scale_fill_manual, scale_color_manual,
+    scale_x_continuous, scale_y_continuous, scale_size_continuous,
+    coord_flip, theme, theme_minimal, theme_void, theme_bw,
+    element_text, element_blank, element_rect, element_line,
+    labs, guides, guide_colorbar, guide_legend,
+    facet_wrap, position_dodge,
+    after_stat
+)
+from mizani.palettes import brewer_pal
+```
+
+```{python}
+#| label: data-loading
+#| code-summary: "Load and inspect raw data"
+
+# ── Load raw CSV files ────────────────────────────────────────────────────────
+indicator1 = pl.read_csv("unicef_indicator_1.csv")
+indicator2 = pl.read_csv("unicef_indicator_2.csv")
+metadata   = pl.read_csv("unicef_metadata.csv")
+
+# ── Quick sanity check ────────────────────────────────────────────────────────
+def summarise_df(name: str, df: pl.DataFrame) -> None:
+    """Print a brief summary of a dataframe."""
+    print(f"{name}: {df.shape[0]:,} rows × {df.shape[1]} cols | "
+          f"{df['country'].n_unique()} countries")
+
+summarise_df("Indicator 1 (Water Access)", indicator1)
+summarise_df("Indicator 2 (Sanitation)",   indicator2)
+summarise_df("Metadata   (Socioeconomic)", metadata)
+```
+
+```{python}
+#| label: data-transformation
+#| code-summary: "Clean and transform data using polars"
+
+# ── Rename long metadata columns for convenience ──────────────────────────────
+meta_clean = metadata.rename({
+    "Population, total":                        "population",
+    "GDP per capita (constant 2015 US$)":       "gdp_per_capita",
+    "Life expectancy at birth, total (years)":  "life_expectancy",
+    "Birth rate, crude (per 1,000 people)":     "birth_rate",
+    "GNI (current US$)":                        "gni",
+})
+
+# ── Filter indicator1 to 'Total' sex (no disaggregation needed) ───────────────
+water = (
+    indicator1
+    .filter(pl.col("sex") == "Total")
+    .select(["country", "alpha_3_code", "time_period", "obs_value"])
+    .rename({"obs_value": "water_pct", "time_period": "year"})
+)
+
+# ── Most recent data point per country (for map & bar chart) ─────────────────
+water_latest = (
+    water
+    .sort("year", descending=True)
+    .group_by("country", "alpha_3_code")
+    .agg(
+        pl.first("water_pct").alias("water_pct"),
+        pl.first("year").alias("latest_year"),
+    )
+)
+
+# ── Global time series: annual mean across all countries ─────────────────────
+water_global_ts = (
+    water
+    .group_by("year")
+    .agg(
+        pl.mean("water_pct").alias("mean_water_pct"),
+        pl.count("country").alias("n_countries"),
+    )
+    .sort("year")
+)
+
+# ── Regional groupings for time-series (manual mapping) ──────────────────────
+region_map = {
+    # Sub-Saharan Africa (sample)
+    "Ethiopia":"Sub-Saharan Africa","Nigeria":"Sub-Saharan Africa",
+    "Kenya":"Sub-Saharan Africa","Tanzania":"Sub-Saharan Africa",
+    "Uganda":"Sub-Saharan Africa","Ghana":"Sub-Saharan Africa",
+    "Mozambique":"Sub-Saharan Africa","Madagascar":"Sub-Saharan Africa",
+    # South Asia
+    "India":"South Asia","Bangladesh":"South Asia","Pakistan":"South Asia",
+    "Nepal":"South Asia","Afghanistan":"South Asia","Sri Lanka":"South Asia",
+    # East Asia & Pacific
+    "China":"East Asia & Pacific","Indonesia":"East Asia & Pacific",
+    "Philippines":"East Asia & Pacific","Vietnam":"East Asia & Pacific",
+    "Thailand":"East Asia & Pacific","Cambodia":"East Asia & Pacific",
+    # Latin America
+    "Brazil":"Latin America","Mexico":"Latin America","Colombia":"Latin America",
+    "Peru":"Latin America","Bolivia":"Latin America","Guatemala":"Latin America",
+    # High Income
+    "United States":"High Income","Germany":"High Income","France":"High Income",
+    "United Kingdom":"High Income","Japan":"High Income","Australia":"High Income",
+}
+
+water_region = (
+    water
+    .with_columns(
+        pl.col("country").replace(region_map, default=None).alias("region")
+    )
+    .filter(pl.col("region").is_not_null())
+    .group_by("region", "year")
+    .agg(pl.mean("water_pct").alias("mean_water_pct"))
+    .sort("region", "year")
+)
+
+# ── Merge water + GDP for scatter ─────────────────────────────────────────────
+# Use 2020 as a stable year with good GDP coverage
+meta_2020 = (
+    meta_clean
+    .filter(pl.col("year") == 2020)
+    .select(["alpha_3_code", "gdp_per_capita", "life_expectancy", "population"])
+    .filter(pl.col("gdp_per_capita").is_not_null())
+)
+
+water_2020 = water.filter(pl.col("year") == 2020)
+
+scatter_df = (
+    water_2020
+    .join(meta_2020, on="alpha_3_code", how="inner")
+    .filter(pl.col("gdp_per_capita").is_not_null())
+    .with_columns(pl.col("gdp_per_capita").log().alias("log_gdp"))
+)
+
+# ── Top/bottom 12 countries for bar chart ────────────────────────────────────
+def get_extremes(df: pl.DataFrame, n: int = 15) -> pl.DataFrame:
+    """Return top-n and bottom-n countries by water access (latest year)."""
+    top = df.sort("water_pct", descending=True).head(n).with_columns(
+        pl.lit("Top (Highest Access)").alias("group")
+    )
+    bottom = df.sort("water_pct").head(n).with_columns(
+        pl.lit("Bottom (Lowest Access)").alias("group")
+    )
+    return pl.concat([bottom, top])
+
+bar_df = get_extremes(water_latest, n=12)
+
+# ── Sanitation indicator 2 ────────────────────────────────────────────────────
+sanitation_latest = (
+    indicator2
+    .filter(pl.col("sex") == "Total")
+    .select(["country", "alpha_3_code", "time_period", "obs_value"])
+    .rename({"obs_value": "sanitation_pct", "time_period": "year"})
+    .sort("year", descending=True)
+    .group_by("country", "alpha_3_code")
+    .agg(pl.first("sanitation_pct").alias("sanitation_pct"))
+)
+
+print("Transformation complete.")
+print(f"  Scatter dataset: {scatter_df.shape[0]} countries with water + GDP data (2020)")
+print(f"  Bar chart: {bar_df.shape[0]} countries (top/bottom 12)")
+print(f"  Time series: {water_region['region'].n_unique()} regions x {water_region['year'].n_unique()} years")
+```
+
+---
+
+## A World Divided by Water
+
+The map below shows just how unevenly access to safe water is distributed. High-income countries in North America, Europe, and Australia are shown in deep green, with close to full coverage. But across Sub-Saharan Africa and parts of South Asia, large areas remain in red, where fewer than half the population can access safely managed water.
+
+Looking at this map, it is hard not to notice that the countries with the lowest access are also some of the most populated and most vulnerable. These are places where children are more likely to drink contaminated water, where waterborne disease remains a leading cause of death, and where women and girls often spend hours each day collecting water instead of going to school or work.
+
+```{python}
+#| label: fig-world-map
+#| fig-cap: "**Figure 1.** Share of population with access to safely managed drinking water (most recent year, 2000-2024). Grey = no data."
+#| fig-width: 12
+#| fig-height: 6
+
+# Load world geometry (pre-downloaded Natural Earth 110m countries)
+world_geo = gpd.read_file("world_countries.geojson")
+
+# Merge geometry with our water data
+water_latest_pd = water_latest.to_pandas()
+world_merged = world_geo.merge(
+    water_latest_pd[["alpha_3_code", "water_pct"]],
+    left_on="ISO_A3",
+    right_on="alpha_3_code",
+    how="left",
+)
+
+(
+    ggplot(world_merged)
+    + geom_map(aes(fill="water_pct"), color="white", size=0.15)
+    + scale_fill_gradientn(
+        colors=["#d73027", "#fc8d59", "#fee08b", "#91cf60", "#1a9850"],
+        na_value="#cccccc",
+        limits=[0, 100],
+        name="% Access",
+    )
+    + theme_void()
+    + labs(
+        title="Access to Safely Managed Drinking Water by Country",
+        subtitle="Percentage of population with access, most recent available year",
+        caption="Source: UNICEF | Grey = no data available",
+    )
+    + theme(
+        plot_title=element_text(size=14, face="bold", ha="center"),
+        plot_subtitle=element_text(size=10, color="#555555", ha="center"),
+        plot_caption=element_text(size=8, color="#888888"),
+        legend_title=element_text(size=9, face="bold"),
+        figure_size=(12, 6),
+    )
+)
+```
+
+---
+
+## Leaders and Laggards: A Tale of Two Worlds
+
+The gap between the best and worst-served countries is not small. Countries like *Finland*, *Iceland*, and *Switzerland* sit above **99%** coverage. Countries like *Ethiopia*, *Papua New Guinea*, and *Chad* are below **20%**. That is a gap of roughly 80 percentage points, representing hundreds of millions of people who do not have reliable access to clean water.
+
+It is also worth noting that every country in the lowest-access group is in Sub-Saharan Africa or the Pacific Islands. This is not a random spread. It reflects a pattern of under-investment that has persisted for decades.
+
+> **Notable finding**: Every country in the "Lowest Access" group is in Sub-Saharan Africa or the Pacific Islands, pointing to a regional crisis that needs targeted investment rather than general global targets.
+
+```{python}
+#| label: fig-bar-chart
+#| fig-cap: "**Figure 2.** Top 12 and bottom 12 countries by share of population with safely managed drinking water access (most recent available year)."
+#| fig-width: 11
+#| fig-height: 7
+
+bar_pd = bar_df.to_pandas().sort_values("water_pct")
+bar_pd["country"] = pd.Categorical(bar_pd["country"], categories=bar_pd["country"], ordered=True)
+
+(
+    ggplot(bar_pd, aes(x="country", y="water_pct", fill="group"))
+    + geom_col(width=0.75, show_legend=True)
+    + geom_text(
+        aes(label="water_pct"),
+        format_string="{:.0f}%",
+        ha="left",
+        nudge_y=1,
+        size=8,
+        color="#333333",
+    )
+    + geom_hline(yintercept=50, linetype="dashed", color="#666666", size=0.6)
+    + scale_fill_manual(
+        values={"Top (Highest Access)": "#1a9850", "Bottom (Lowest Access)": "#d73027"},
+        name="",
+    )
+    + scale_y_continuous(limits=(0, 108), expand=(0, 0))
+    + coord_flip()
+    + labs(
+        title="Water Access Champions and Those Left Behind",
+        subtitle="Top and bottom 12 countries, most recent available data",
+        x="",
+        y="Population with Safely Managed Water Access (%)",
+        caption="Source: UNICEF | Dashed line = 50% threshold",
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(size=13, face="bold"),
+        plot_subtitle=element_text(size=10, color="#555555"),
+        plot_caption=element_text(size=8, color="#888888"),
+        axis_text_y=element_text(size=9),
+        legend_position="bottom",
+        panel_grid_major_y=element_blank(),
+        figure_size=(11, 7),
+    )
+)
+```
+
+---
+
+## Two Decades of Progress, and Its Limits
+
+Since 2000, the world has made real progress on water access, but it has not been even across regions. The chart below tracks average access rates for five regions over the past two decades.
+
+High-income countries stayed above 95% throughout. Latin America and East Asia showed consistent improvement. South Asia made meaningful gains too, though it still has a way to go. Sub-Saharan Africa improved the least, and it remains the furthest from universal access by a significant margin.
+
+Progress is clearly possible. But looking at the pace of change in the most vulnerable regions, it is hard to feel confident that things will improve fast enough without a more deliberate push.
+
+- **High-income countries** have stayed near full coverage since 2000.
+- **Latin America** and **East Asia & Pacific** both show steady upward trends.
+- **South Asia** has improved, though gaps remain large.
+- **Sub-Saharan Africa** has made the least progress and still has the furthest to go.
+
+```{python}
+#| label: fig-timeseries
+#| fig-cap: "**Figure 3.** Average share of population with safely managed drinking water access by world region, 2000-2024."
+#| fig-width: 11
+#| fig-height: 6
+
+region_pd = water_region.to_pandas()
+
+region_colors = {
+    "High Income":          "#1a9850",
+    "Latin America":        "#4393c3",
+    "East Asia & Pacific":  "#9970ab",
+    "South Asia":           "#f4a736",
+    "Sub-Saharan Africa":   "#d73027",
+}
+
+(
+    ggplot(region_pd, aes(x="year", y="mean_water_pct", color="region"))
+    + geom_line(size=1.2)
+    + geom_point(size=1.8, alpha=0.7)
+    + scale_color_manual(values=region_colors, name="Region")
+    + scale_x_continuous(breaks=list(range(2000, 2025, 4)))
+    + scale_y_continuous(limits=(0, 105), labels=lambda l: [f"{v:.0f}%" for v in l])
+    + geom_hline(yintercept=100, linetype="dotted", color="#aaaaaa", size=0.5)
+    + labs(
+        title="Two Decades of Water Access Progress by Region",
+        subtitle="Annual average across sampled countries within each region, 2000-2024",
+        x="Year",
+        y="Mean Population with Safe Water Access (%)",
+        caption="Source: UNICEF | Regions based on a representative sample of countries",
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(size=13, face="bold"),
+        plot_subtitle=element_text(size=10, color="#555555"),
+        plot_caption=element_text(size=8, color="#888888"),
+        legend_title=element_text(size=9, face="bold"),
+        legend_position="right",
+        panel_grid_minor=element_blank(),
+        figure_size=(11, 6),
+    )
+)
+```
+
+---
+
+## The Wealth-Water Connection
+
+The scatterplot below looks at the relationship between **GDP per capita** and **water access** in 2020, using a log scale for GDP to handle the wide spread of income levels across countries.
+
+The trend is fairly clear: wealthier countries tend to have higher water access. The regression line captures that pattern well. But what is interesting is the scatter around that line.
+
+Some middle-income countries do better than you would expect from their GDP alone, which suggests that investment decisions and governance matter a lot. Others with similar income levels perform much worse, pointing to where policy has probably fallen short. And the cluster of high-income countries sitting at near-100% access at the top right shows that this problem is solvable. It has been solved. Just not everywhere.
+
+- Some **middle-income countries** outperform their income peers, showing that policy choices matter.
+- Others at similar income levels lag behind, suggesting infrastructure investment has not kept up.
+- **High-income countries** at the top right have essentially resolved this issue, which makes the ongoing gap elsewhere harder to justify.
+
+```{python}
+#| label: fig-scatter
+#| fig-cap: "**Figure 4.** Relationship between GDP per capita (log scale) and population with safely managed drinking water access, 2020. Each point is a country; size reflects population."
+#| fig-width: 11
+#| fig-height: 6.5
+
+scatter_pd = scatter_df.to_pandas()
+scatter_pd["population_m"] = scatter_pd["population"] / 1e6
+
+(
+    ggplot(scatter_pd, aes(x="log_gdp", y="water_pct"))
+    + geom_point(
+        aes(size="population_m"),
+        alpha=0.55,
+        color="#2166ac",
+    )
+    + geom_smooth(method="lm", color="#d73027", fill="#f4a4a4", size=1.2)
+    + scale_size_continuous(
+        range=(1, 14),
+        name="Population (M)",
+        breaks=[10, 100, 500, 1000],
+    )
+    + scale_x_continuous(
+        breaks=[5, 6, 7, 8, 9, 10, 11, 12],
+        labels=["$150", "$400", "$1.1K", "$3K", "$8K", "$22K", "$60K", "$162K"],
+    )
+    + scale_y_continuous(limits=(0, 105), labels=lambda l: [f"{v:.0f}%" for v in l])
+    + labs(
+        title="Wealthier Countries Have Better Water Access, but Exceptions Exist",
+        subtitle="Each dot is a country in 2020; dot size = population; regression line in red",
+        x="GDP per Capita (constant 2015 USD, log scale)",
+        y="Population with Safely Managed Water Access (%)",
+        caption="Source: UNICEF + World Bank | 2020 data",
+    )
+    + theme_bw()
+    + theme(
+        plot_title=element_text(size=13, face="bold"),
+        plot_subtitle=element_text(size=10, color="#555555"),
+        plot_caption=element_text(size=8, color="#888888"),
+        legend_title=element_text(size=9, face="bold"),
+        panel_grid_minor=element_blank(),
+        figure_size=(11, 6.5),
+    )
+)
+```
+
+---
+
+## Conclusion: The Cost of Inaction
+
+After more than two decades of effort, safe drinking water is still out of reach for hundreds of millions of people, and they are concentrated in the world's poorest countries.
+
+### What the Data Shows
+
+- **Geography shapes access**: Sub-Saharan Africa has the most countries with the lowest water access, and has seen the least improvement over time.
+- **Wealth matters, but it is not the whole story**: Richer countries generally have better access, but some middle-income countries punch above their weight when they invest deliberately in infrastructure.
+- **Progress is real but too slow**: Access has improved globally since 2000, but the current pace is not fast enough to reach universal coverage within this generation.
+
+### What Needs to Happen
+
+1. **More targeted funding** for the countries with the lowest access, where investment in basic infrastructure could have an outsized impact.
+2. **Better accountability** to make sure international aid actually reaches the people who need it, not just the headline statistics.
+3. **Gender-focused planning**: In water-scarce regions, women and girls carry most of the burden of collecting water. Any serious response has to address that directly.
+
+> *Clean water is not a technical problem. We know how to build pipes and treatment systems. The question is whether there is enough political will to prioritise the places where it matters most.*
+
+---
+
+*Report produced using UNICEF indicator data (2000-2024). Visualisations created with `plotnine`. Data transformations performed with `polars`. Rendered with Quarto.*
